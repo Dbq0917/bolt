@@ -39,6 +39,24 @@ const (
 // default page size for db is set to the OS page size.
 var defaultPageSize = os.Getpagesize()
 
+// rwlock serializes write transactions so that only one writer is active
+// at a time. Callers go through lock/unlock instead of touching the
+// underlying mutex directly, which keeps the locking strategy encapsulated
+// in a single layer. Its behavior is identical to holding one sync.Mutex.
+type rwlock struct {
+	mu sync.Mutex
+}
+
+// lock acquires the writer lock, blocking until no other writer holds it.
+func (r *rwlock) lock() {
+	r.mu.Lock()
+}
+
+// unlock releases the writer lock.
+func (r *rwlock) unlock() {
+	r.mu.Unlock()
+}
+
 // DB represents a collection of buckets persisted to a file on disk.
 // All data access is performed through transactions which can be obtained through the DB.
 // All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
@@ -115,7 +133,7 @@ type DB struct {
 	batchMu sync.Mutex
 	batch   *batch
 
-	rwlock   sync.Mutex   // Allows only one writer at a time.
+	rwlock   rwlock       // Allows only one writer at a time.
 	metalock sync.Mutex   // Protects meta page access.
 	mmaplock sync.RWMutex // Protects mmap access during remapping.
 	statlock sync.RWMutex // Protects stats access.
@@ -389,8 +407,8 @@ func (db *DB) init() error {
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
-	db.rwlock.Lock()
-	defer db.rwlock.Unlock()
+	db.rwlock.lock()
+	defer db.rwlock.unlock()
 
 	db.metalock.Lock()
 	defer db.metalock.Unlock()
@@ -509,7 +527,7 @@ func (db *DB) beginRWTx() (*Tx, error) {
 
 	// Obtain writer lock. This is released by the transaction when it closes.
 	// This enforces only one writer transaction at a time.
-	db.rwlock.Lock()
+	db.rwlock.lock()
 
 	// Once we have the writer lock then we can lock the meta pages so that
 	// we can set up the transaction.
@@ -518,7 +536,7 @@ func (db *DB) beginRWTx() (*Tx, error) {
 
 	// Exit if the database is not open yet.
 	if !db.opened {
-		db.rwlock.Unlock()
+		db.rwlock.unlock()
 		return nil, ErrDatabaseNotOpen
 	}
 

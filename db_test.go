@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -458,6 +459,110 @@ func TestDB_BeginRW_Closed(t *testing.T) {
 	var db bolt.DB
 	if _, err := db.Begin(true); err != bolt.ErrDatabaseNotOpen {
 		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
+// Ensure that concurrent writers are serialized while readers observe only
+// committed state, and that no writes are lost.
+func TestDB_ConcurrentWriteRead(t *testing.T) {
+	db := MustOpenDB()
+	defer db.MustClose()
+
+	const writerN = 8
+	const writesPerGoroutine = 50
+
+	if err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucket([]byte("widgets"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writers each increment the same key in its own transaction.
+	for i := 0; i < writerN; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < writesPerGoroutine; j++ {
+				if err := db.Update(func(tx *bolt.Tx) error {
+					b := tx.Bucket([]byte("widgets"))
+					value := b.Get([]byte("counter"))
+					var counter uint64
+					if value != nil {
+						counter = binary.BigEndian.Uint64(value)
+					}
+					var buf [8]byte
+					binary.BigEndian.PutUint64(buf[:], counter+1)
+					return b.Put([]byte("counter"), buf[:])
+				}); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+
+	// Readers run concurrently with the writers and must only ever see a
+	// committed counter within the valid range.
+	var observed sync.WaitGroup
+	var sawProgress uint32
+	for i := 0; i < 4; i++ {
+		observed.Add(1)
+		go func() {
+			defer observed.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if err := db.View(func(tx *bolt.Tx) error {
+					value := tx.Bucket([]byte("widgets")).Get([]byte("counter"))
+					if value == nil {
+						return nil
+					}
+					counter := binary.BigEndian.Uint64(value)
+					if counter > writerN*writesPerGoroutine {
+						t.Errorf("counter out of range: %d", counter)
+					}
+					if counter > 0 {
+						atomic.StoreUint32(&sawProgress, 1)
+					}
+					return nil
+				}); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(done)
+	observed.Wait()
+
+	if sawProgress == 0 {
+		t.Fatal("readers never observed an updated counter")
+	}
+
+	// Every increment must be visible once the writers finish.
+	if err := db.View(func(tx *bolt.Tx) error {
+		value := tx.Bucket([]byte("widgets")).Get([]byte("counter"))
+		if value == nil {
+			t.Fatal("counter missing after concurrent writes")
+		}
+		if counter := binary.BigEndian.Uint64(value); counter != writerN*writesPerGoroutine {
+			t.Fatalf("unexpected counter: %d != %d", counter, writerN*writesPerGoroutine)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

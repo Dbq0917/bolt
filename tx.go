@@ -269,7 +269,7 @@ func (tx *Tx) close() {
 
 		// Remove transaction ref & writer lock.
 		tx.db.rwtx = nil
-		tx.db.rwlock.Unlock()
+		tx.db.rwlock.unlock()
 
 		// Merge statistics.
 		tx.db.statlock.Lock()

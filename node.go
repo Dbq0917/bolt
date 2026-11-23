@@ -507,6 +507,69 @@ func (n *node) rebalance() {
 	n.parent.rebalance()
 }
 
+// fillNext moves as many leading inodes as possible from the next sibling
+// into this node without exceeding the given threshold size. If the sibling
+// is emptied then it is removed from the tree. It returns true if any inodes
+// were moved. This is used by compaction to repack sparsely filled nodes
+// left over from random page splits. Unlike rebalance, it never grows a node
+// past the threshold so the node will not be split again during spill.
+func (n *node) fillNext(threshold int) bool {
+	if n.parent == nil {
+		return false
+	}
+	sib := n.nextSibling()
+	if sib == nil {
+		return false
+	}
+
+	// Determine how many of the sibling's leading inodes fit into this node.
+	sz, elsz := n.size(), n.pageElementSize()
+	var count int
+	for i := range sib.inodes {
+		inode := &sib.inodes[i]
+		sz += elsz + len(inode.key) + len(inode.value)
+		if sz > threshold {
+			break
+		}
+		count++
+	}
+
+	// Move the remaining inodes as well if too few would be left behind.
+	if count < len(sib.inodes) && len(sib.inodes)-count < sib.minKeys() {
+		count = len(sib.inodes)
+	}
+	if count == 0 {
+		return false
+	}
+
+	// Reparent all child nodes being moved.
+	for _, inode := range sib.inodes[:count] {
+		if child, ok := n.bucket.nodes[inode.pgid]; ok {
+			sib.removeChild(child)
+			child.parent = n
+			n.children = append(n.children, child)
+		}
+	}
+
+	// Move the inodes into this node.
+	n.inodes = append(n.inodes, sib.inodes[:count]...)
+	sib.inodes = sib.inodes[count:]
+
+	// Remove the sibling if it is empty. Otherwise update the parent's
+	// separator key to the sibling's new first key.
+	if len(sib.inodes) == 0 {
+		n.parent.del(sib.key)
+		n.parent.removeChild(sib)
+		delete(n.bucket.nodes, sib.pgid)
+		sib.free()
+	} else {
+		n.parent.put(sib.key, sib.inodes[0].key, nil, sib.pgid, 0)
+		sib.key = sib.inodes[0].key
+	}
+
+	return true
+}
+
 // removes a node from the list of in-memory children.
 // This does not affect the inodes.
 func (n *node) removeChild(target *node) {

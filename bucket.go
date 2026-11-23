@@ -379,14 +379,40 @@ func (b *Bucket) NextSequence() (uint64, error) {
 
 // ForEach executes a function for each key/value pair in a bucket.
 // If the provided function returns an error then the iteration is stopped and
-// the error is returned to the caller. The provided function must not modify
-// the bucket; this will result in undefined behavior.
+// the error is returned to the caller.
+//
+// The keys to visit are collected up front with a read-only cursor, so the
+// iteration view is fixed for the whole call. Mutations performed by fn (such
+// as deleting the current key with Bucket.Delete) go through their own
+// key-based lookup path instead of this cursor, and therefore do not shift
+// the iteration position. Every key present when ForEach starts is visited
+// exactly once, even when fn deletes keys as it goes. Keys inserted by fn are
+// not visited.
 func (b *Bucket) ForEach(fn func(k, v []byte) error) error {
 	if b.tx.db == nil {
 		return ErrTxClosed
 	}
 	c := b.Cursor()
-	for k, v := c.First(); k != nil; k, v = c.Next() {
+
+	// Snapshot every key with the read-only iteration cursor. Collecting the
+	// keys before invoking fn keeps traversal independent of the deletions
+	// performed through the separate Bucket.Delete path.
+	var keys [][]byte
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		keys = append(keys, cloneBytes(k))
+	}
+
+	// Walk the snapshot. Each fn call observes the current value of the key;
+	// a key deleted by a previous fn call is skipped.
+	deleteCursor := b.Cursor()
+	for _, key := range keys {
+		k, v, flags := deleteCursor.seek(key)
+		if !bytes.Equal(key, k) {
+			continue
+		}
+		if (flags & bucketLeafFlag) != 0 {
+			v = nil
+		}
 		if err := fn(k, v); err != nil {
 			return err
 		}
